@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>8-Point FFT · Decimation in Time</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark;--bg:#070713;--panel:#0e0e24;--c0:#00e5ff;--c1:#ff2bd6;--c2:#ffe600;--c3:#39ff14;--tx:#d8e6ff}
+*{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{background:radial-gradient(circle at 50% 0,#17123a,var(--bg) 60%);color:var(--tx);font-family:"Share Tech Mono",ui-monospace,Menlo,monospace;
+display:flex;flex-direction:column;height:100dvh;overflow:hidden;padding:env(safe-area-inset-top,0) 8px env(safe-area-inset-bottom,0);gap:6px}
+h1{font-family:Orbitron,Verdana,sans-serif;font-size:15px;text-align:center;letter-spacing:2px;padding-top:6px;
+background:linear-gradient(90deg,var(--c0),var(--c1),var(--c2),var(--c3));-webkit-background-clip:text;background-clip:text;color:transparent}
+h1 small{display:block;font-size:9px;letter-spacing:3px;color:#7f8fc0;-webkit-text-fill-color:#7f8fc0;font-weight:600}
+.chips{display:flex;gap:5px;justify-content:center;flex-wrap:wrap}
+button{font-family:inherit;color:var(--tx);background:var(--panel);border:1px solid #2c2c5a;border-radius:8px;padding:6px 9px;font-size:12px;cursor:pointer}
+.chip.on{border-color:var(--c0);color:#001018;background:linear-gradient(90deg,var(--c0),#7cf3ff);box-shadow:0 0 10px var(--c0)}
+#wrap{flex:1;min-height:0;position:relative;border:1px solid #23235a;border-radius:12px;background:#09091c;box-shadow:inset 0 0 30px #1a1a55}
+#cv{position:absolute;inset:0;width:100%;height:100%}
+#spec{width:100%;height:58px;border:1px solid #23235a;border-radius:10px;background:#09091c;display:block}
+#calc{background:var(--panel);border:1px solid #2c2c5a;border-radius:10px;padding:6px 9px;font-size:10.5px;line-height:1.3;height:116px;flex:0 0 auto;overflow:auto;white-space:normal}
+#calc.complete{font-size:10px;line-height:1.25}
+#calc .fft-note{color:#9eadd8;font-size:9px}
+#bitrev-banner{flex:0 0 auto;background:#2a080d;border:2px solid #ff3030;border-radius:10px;padding:8px 10px;color:#ff4545;font-family:Orbitron,"Share Tech Mono",monospace;font-size:14px;font-weight:800;line-height:1.3;text-align:center;text-shadow:0 0 8px rgba(255,48,48,.35)}
+#bitrev-banner small{display:block;font-family:"Share Tech Mono",monospace;font-size:11px;font-weight:600;color:#ff9a9a;margin-top:3px;text-shadow:none}
+#calc b{font-family:Orbitron,sans-serif;font-size:10px}
+.ctl{display:flex;gap:6px;align-items:center;padding-bottom:6px}
+.ctl button{flex:0 0 auto;min-width:40px;font-size:15px}
+#play{background:linear-gradient(90deg,var(--c1),#ff7a3c);border:0;color:#fff;min-width:56px;box-shadow:0 0 12px var(--c1)}
+.ctl input{flex:1;min-width:0;accent-color:var(--c3)}
+</style>
+</head>
+<body>
+<h1>8-POINT FFT<small>DECIMATION IN TIME · SIGNAL FLOW</small></h1>
+<div id="bitrev-banner">BIT-REVERSED INPUTS<small>For an 8-point radix-2 DIT FFT, reverse the 3 binary bits of each index: 001₂ (1) → 100₂ (4), 011₂ (3) → 110₂ (6). Input order: 0, 4, 2, 6, 1, 5, 3, 7.</small></div>
+<div class="chips" id="chips"></div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<canvas id="spec" role="img" aria-label="Progressive FFT magnitude spectrum" title="Magnitude |X[k]|. The vertical scale is fixed by the largest magnitude in the complete FFT, even while results are revealed progressively."></canvas>
+<div id="calc"></div>
+<div class="ctl">
+<button id="rst" title="Reset">⏮</button><button id="back" title="Back">◀</button>
+<button id="play">⏸</button><button id="fwd" title="Step">▶|</button>
+<input id="spd" type="range" min="0.4" max="3" step="0.1" value="1" title="Speed">
+</div>
+<script>
+const N=8, REV=[0,4,2,6,1,5,3,7], COL=['#00e5ff','#ff2bd6','#ffe600','#39ff14'];
+const SIGS={
+ 'All 1s':n=>1,'1 0 1 0':n=>n%2?0:1,'Sine':n=>Math.sin(2*Math.PI*n/N),'Cosine':n=>Math.cos(2*Math.PI*n/N),'Impulse':n=>n?0:1};
+const SUB={2:'₂',4:'₄',8:'₈'}, SUP=['⁰','¹','²','³'];
+const cmul=(a,b)=>[a[0]*b[0]-a[1]*b[1],a[0]*b[1]+a[1]*b[0]],cadd=(a,b)=>[a[0]+b[0],a[1]+b[1]],csub=(a,b)=>[a[0]-b[0],a[1]-b[1]];
+const f=v=>{let s=(Math.abs(v)<5e-3?0:v).toFixed(2).replace(/\.?0+$/,'');return s==='-0'||s===''?'0':s};
+const cs=c=>{const r=f(c[0]),i=f(c[1]);if(i==='0')return r;if(r==='0')return i+'j';return r+(c[1]<0?'':'+')+i+'j'};
+let stages,B,nodeB,sigName='Sine',t=0,playing=true,speed=1,last=0,calcKey='';
+
+function build(name){
+ sigName=name;const x=[...Array(N)].map((_,n)=>[SIGS[name](n),0]);
+ stages=[REV.map(i=>x[i])];B=[];nodeB=[0,1,2,3].map(()=>Array(N).fill(-1));
+ for(let s=1;s<=3;s++){
+  const m=1<<s,h=m/2,prev=stages[s-1],out=[];
+  for(let k=0;k<N;k+=m)for(let j=0;j<h;j++){
+   const tp=k+j,bt=k+j+h,ang=-2*Math.PI*j/m,w=[Math.cos(ang),Math.sin(ang)],a=prev[tp],b=prev[bt],tt=cmul(w,b);
+   out[tp]=cadd(a,tt);out[bt]=csub(a,tt);
+   nodeB[s][tp]=nodeB[s][bt]=B.length;
+   B.push({s,tp,bt,j,m,w,a,b,t:tt,o1:out[tp],o2:out[bt]});
+  }
+  stages.push(out);
+ }
+ t=0;calcKey='';
+ document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',c.textContent===name));
+}
+const chips=document.getElementById('chips');
+Object.keys(SIGS).forEach(k=>{const b=document.createElement('button');b.className='chip';b.textContent=k;b.onclick=()=>{build(k);playing=true;sync()};chips.appendChild(b)});
+
+const cv=document.getElementById('cv'),cx=cv.getContext('2d'),sp=document.getElementById('spec'),sx=sp.getContext('2d');
+let W,H,SW,SH,L=44,R=46,TOP=34,BOT=14;
+function size(){
+ const d=window.devicePixelRatio||1,r=cv.getBoundingClientRect();W=r.width;H=r.height;cv.width=W*d;cv.height=H*d;cx.setTransform(d,0,0,d,0,0);
+ const q=sp.getBoundingClientRect();SW=q.width;SH=q.height;sp.width=SW*d;sp.height=SH*d;sx.setTransform(d,0,0,d,0,0);
+}
+new ResizeObserver(size).observe(document.getElementById('wrap'));addEventListener('resize',size);
+const X=c=>L+c*(W-L-R)/3, Y=r=>TOP+r*(H-TOP-BOT)/7;
+
+function state(){const cur=Math.min(Math.floor(t),12);return{cur,p:t>=12?0:t-cur}}
+function computed(s,i,cur,p){if(s===0)return true;const b=nodeB[s][i];return b<cur||(b===cur&&p>0.5)}
+
+function pill(txt,x,y,col,al='center'){
+ cx.font='9.5px "Share Tech Mono",monospace';const w=cx.measureText(txt).width+6;
+ const lx=al==='center'?x-w/2:x;cx.fillStyle='rgba(7,7,19,.85)';cx.fillRect(lx,y-7,w,13);
+ cx.fillStyle=col;cx.textAlign='left';cx.textBaseline='middle';cx.fillText(txt,lx+3,y);
+}
+function edge(x1,y1,x2,y2,col,al,dash,lw,glow,frac){
+ cx.save();cx.globalAlpha=al;cx.strokeStyle=col;cx.lineWidth=lw;cx.setLineDash(dash?[5,4]:[]);
+ if(glow){cx.shadowColor=col;cx.shadowBlur=10}
+ cx.beginPath();cx.moveTo(x1,y1);cx.lineTo(x2,y2);cx.stroke();cx.restore();
+ if(frac!==null){cx.save();cx.fillStyle='#fff';cx.shadowColor=col;cx.shadowBlur=12;cx.beginPath();
+  cx.arc(x1+(x2-x1)*frac,y1+(y2-y1)*frac,3.5,0,7);cx.fill();cx.restore()}
+}
+function arrowHead(x1,y1,x2,y2,col,alpha){
+ const ang=Math.atan2(y2-y1,x2-x1),len=4.2;
+ cx.save();cx.globalAlpha=alpha;cx.fillStyle=col;cx.beginPath();
+ cx.moveTo(x2,y2);
+ cx.lineTo(x2-len*Math.cos(ang-0.48),y2-len*Math.sin(ang-0.48));
+ cx.lineTo(x2-len*Math.cos(ang+0.48),y2-len*Math.sin(ang+0.48));
+ cx.closePath();cx.fill();cx.restore();
+}
+function draw(){
+ const {cur,p}=state();cx.clearRect(0,0,W,H);
+ ['1-pt','2-pt','4-pt','8-pt'].forEach((n,i)=>{cx.font='bold 11px Orbitron,sans-serif';cx.fillStyle=COL[i];cx.textAlign='center';cx.textBaseline='middle';
+  cx.shadowColor=COL[i];cx.shadowBlur=8;cx.fillText(n,X(i),12);cx.shadowBlur=0;
+  cx.font='8px "Share Tech Mono",monospace';cx.fillStyle='#6f7fb0';cx.fillText('DFT',X(i),24)});
+ // edges
+ B.forEach((b,bi)=>{
+  const col=COL[b.s],x1=X(b.s-1),x2=X(b.s),isC=bi===cur&&t<12,done=bi<cur||t>=12;
+  const al=isC?1:done?.5:.12,lw=isC?2.2:1.1,fr=isC&&p<.5?p/.5:null;
+  const yt=Y(b.tp),yb=Y(b.bt);
+  edge(x1,yt,x2,yt,col,al,false,lw,isC,fr);
+  edge(x1,yt,x2,yb,col,al,false,lw,isC,fr);
+  edge(x1,yb,x2,yt,col,al,false,lw,isC,fr);
+  edge(x1,yb,x2,yb,col,al,true,lw,isC,fr);
+  // Small directional arrowheads clarify left-to-right data flow.
+  const ax=x1+(x2-x1)*.78;
+  arrowHead(ax,yt,ax+0.1*(x2-x1),yt,col,al);
+  arrowHead(ax,yt+(yb-yt)*.78,ax+0.1*(x2-x1),yt+(yb-yt)*.78+0.1*(yb-yt),col,al);
+  arrowHead(ax,yb+(yt-yb)*.78,ax+0.1*(x2-x1),yb+(yt-yb)*.78+0.1*(yt-yb),col,al);
+  arrowHead(ax,yb,ax+0.1*(x2-x1),yb,col,al);
+ });
+ // current twiddle labels
+ if(cur<12&&t<12){const b=B[cur],x1=X(b.s-1),x2=X(b.s),nm='W'+SUB[b.m]+SUP[b.j]||'';
+  pill(nm,x1+(x2-x1)*.5,Y(b.tp)+(Y(b.bt)-Y(b.tp))*.5-0,COL[b.s]);
+  pill('−'+nm,x1+(x2-x1)*.62,Y(b.bt)-9,COL[b.s])}
+ // nodes
+ for(let s=0;s<4;s++)for(let i=0;i<N;i++){
+  const x=X(s),y=Y(i),ok=computed(s,i,cur,p),col=COL[s];
+  const isIn=cur<12&&t<12&&s>0&&(B[cur].s===s)&&(i===B[cur].tp||i===B[cur].bt);
+  const inP=cur<12&&t<12&&B[cur].s===s+1&&(i===B[cur].tp||i===B[cur].bt);
+  cx.save();cx.beginPath();cx.arc(x,y,isIn&&p>.5?7:5,0,7);cx.fillStyle=ok?col:'#0a0a1c';cx.strokeStyle=col;cx.lineWidth=1.5;
+  if(ok||inP){cx.shadowColor=col;cx.shadowBlur=inP||isIn?14:6}cx.fill();cx.stroke();cx.restore();
+  if(ok){const v=stages[s][i];pill(cs(v),x,y-12,col)}
+ }
+ // index labels
+ cx.font='10px "Share Tech Mono",monospace';cx.textBaseline='middle';
+ for(let i=0;i<N;i++){
+  cx.textAlign='left';cx.fillStyle=COL[0];cx.fillText('x('+REV[i]+')',2,Y(i));
+  cx.textAlign='right';cx.fillStyle=computed(3,i,cur,p)?COL[3]:'#4a5580';cx.fillText('X('+i+')',W-2,Y(i));
+ }
+}
+function spec(){
+ const {cur,p}=state();sx.clearRect(0,0,SW,SH);
+ const mags=stages[3].map(c=>Math.hypot(c[0],c[1])),mx=Math.max(...mags,1e-9),bw=SW/N,hh=SH-22;
+ sx.fillStyle='#9eadd8';sx.font='8px "Share Tech Mono",monospace';sx.textAlign='left';sx.fillText('MAGNITUDE |X[k]| · fixed scale = max of complete FFT',5,9);
+ for(let k=0;k<N;k++){
+  const ok=computed(3,k,cur,p),x=k*bw+bw*.2,w=bw*.6;
+  sx.fillStyle='#14143a';sx.fillRect(x,12,w,hh);
+  if(ok){const h=Math.max(1,mags[k]/mx*hh),g=sx.createLinearGradient(0,hh,0,0);g.addColorStop(0,'#39ff14');g.addColorStop(1,'#00e5ff');
+   sx.fillStyle=g;sx.shadowColor='#39ff14';sx.shadowBlur=6;sx.fillRect(x,12+hh-h,w,h);sx.shadowBlur=0;
+   sx.fillStyle='#d8e6ff';sx.font='9px "Share Tech Mono",monospace';sx.textAlign='center';sx.fillText(f(mags[k]),x+w/2,Math.max(19,12+hh-h-1+2))}
+  sx.fillStyle='#7f8fc0';sx.font='9px "Share Tech Mono",monospace';sx.textAlign='center';sx.fillText('|X('+k+')|',x+w/2,SH-3);
+ }
+}
+const calc=document.getElementById('calc');
+function updCalc(){
+ const {cur,p}=state(),ph=t>=12?9:t===0?-1:(p>.5?2:p>.25?1:0),key=cur+'_'+ph;if(key===calcKey)return;calcKey=key;
+ if(t>=12){
+  calc.classList.add('complete');
+  calc.innerHTML='<b style="color:#39ff14">✓ COMPLETE · 12 BUTTERFLIES · '+sigName+'</b><br>'+
+   'X[0] = '+cs(stages[3][0])+' &nbsp; X[1] = '+cs(stages[3][1])+'<br>'+
+   'X[2] = '+cs(stages[3][2])+' &nbsp; X[3] = '+cs(stages[3][3])+'<br>'+
+   'X[4] = '+cs(stages[3][4])+' &nbsp; X[5] = '+cs(stages[3][5])+'<br>'+
+   'X[6] = '+cs(stages[3][6])+' &nbsp; X[7] = '+cs(stages[3][7])+'<br>'+
+   '<span class="fft-note">Forward DFT: e^(−j2πkn/8) · unnormalized · bit-reversed inputs, natural-order outputs.</span>';
+  return
+ }
+ calc.classList.remove('complete');
+ if(t===0){calc.innerHTML='<b style="color:#00e5ff">READY</b> · '+sigName+'<br><b>WHY BIT-REVERSED INPUTS?</b> For an 8-point radix-2 DIT FFT, reverse each index’s 3 binary bits. Example: 001₂ (1) → 100₂ (4); 011₂ (3) → 110₂ (6). This creates the order <b>0, 4, 2, 6, 1, 5, 3, 7</b> and lets the FFT produce output bins in normal order.<br><span class="fft-note">Forward DFT: e^(−j2πkn/8) · unnormalized (no 1/N factor).</span><br>Press ⏸/▶ or ▶| to step through 12 butterflies.';return}
+ const b=B[cur],c=COL[b.s],nm='W'+SUB[b.m]+SUP[b.j];
+ let h='<b style="color:'+c+'">STAGE '+b.s+' · BFLY '+(cur+1)+'/12</b> '+nm+' = '+cs(b.w)+'<br>';
+ h+='a = '+cs(b.a)+'   b = '+cs(b.b)+'<br>';
+ h+=ph>=1?'t = '+nm+'·b = '+cs(b.t)+'<br>':'t = '+nm+'·b = …<br>';
+ h+=ph>=2?'<span style="color:'+c+'">a+t → '+cs(b.o1)+'   a−t → '+cs(b.o2)+'</span>':'a+t → …   a−t → …';
+ calc.innerHTML=h;
+}
+const play=document.getElementById('play');
+function sync(){play.textContent=playing?'⏸':'▶'}
+play.onclick=()=>{if(t>=12){t=0;calcKey=''}playing=!playing;sync()};
+document.getElementById('rst').onclick=()=>{t=0;playing=false;calcKey='';sync()};
+document.getElementById('fwd').onclick=()=>{playing=false;t=Math.min(12,Math.floor(t)+1);sync()};
+document.getElementById('back').onclick=()=>{playing=false;t=Math.max(0,Math.ceil(t)-1);sync()};
+document.getElementById('spd').oninput=e=>speed=+e.target.value;
+function loop(now){
+ const dt=Math.max(0,Math.min(.1,(now-last)/1000));last=now;
+ if(playing&&t<12){t=Math.min(12,t+dt*speed/1.5);if(t>=12){playing=false;sync()}}
+ if(W){draw();spec();updCalc()}
+ requestAnimationFrame(loop);
+}
+build('Sine');size();sync();requestAnimationFrame(loop);
+</script>
+</body>
+</html>
